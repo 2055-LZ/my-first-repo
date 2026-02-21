@@ -94,13 +94,15 @@ class TimeManagementSystem:
             self._append_rest(deep_end, 20)
 
         while True:
-            task = self._next_available_task(other_items)
+            task = self._next_available_task(other_items, cursor)
             if not task:
                 break
 
             slot = self._find_next_slot(cursor, task)
             if not slot:
                 break
+       codex/add-rolling-rearrangement-function-0u0tnx
+       main
             start, end, low_rel = slot
             reason = "常规调度"
             if low_rel:
@@ -124,9 +126,7 @@ class TimeManagementSystem:
                 done = Block(block.task_name, block.start, current_time, block.reason + "（已完成部分）", block.low_reliability)
                 past_blocks.append(done)
                 remaining_minutes = int((block.end - current_time).total_seconds() // 60)
-                remaining_items.append(
-                    self._carry_over_task_from_block(block, remaining_minutes)
-                )
+                remaining_items.append(self._carry_over_task_from_block(block, remaining_minutes))
             else:
                 remaining_minutes = int((block.end - block.start).total_seconds() // 60)
                 remaining_items.append(self._carry_over_task_from_block(block, remaining_minutes))
@@ -187,9 +187,19 @@ class TimeManagementSystem:
             )
         return expanded
 
-    def _next_available_task(self, tasks: List[Task]) -> Optional[Task]:
+    def _next_available_task(self, tasks: List[Task], cursor: datetime) -> Optional[Task]:
+        english_task = self._english_task_with_remaining(tasks)
+        if english_task and cursor < self._at(ENGLISH_ONLY_END):
+            return english_task
+
         for task in tasks:
             if task.remaining_minutes > 0:
+                return task
+        return None
+
+    def _english_task_with_remaining(self, tasks: List[Task]) -> Optional[Task]:
+        for task in tasks:
+            if task.category == "english" and task.remaining_minutes > 0:
                 return task
         return None
 
@@ -198,6 +208,10 @@ class TimeManagementSystem:
         earliest_start = task.metadata.get("earliest_start")
         if earliest_start:
             t = max(t, datetime.fromisoformat(earliest_start))
+
+        if task.category == "english" and t < self._at(ENGLISH_ONLY_START):
+            t = self._at(ENGLISH_ONLY_START)
+
         end_of_day = self._at(DAY_END)
         step = timedelta(minutes=5)
 
@@ -233,7 +247,7 @@ class TimeManagementSystem:
         low_reliability = False
 
         for event in self.fixed_events:
-            overlap = not (end <= event.start or start >= event.end)
+            overlap = self._event_overlap(start, end, event)
             if not overlap:
                 continue
 
@@ -248,6 +262,12 @@ class TimeManagementSystem:
                 return True, False
 
         return False, low_reliability
+
+    def _event_overlap(self, start: datetime, end: datetime, event: FixedEvent) -> bool:
+        if not event.is_class:
+            return not (end <= event.start or start >= event.end)
+        # 上课窗口按“结束点也算低可靠边界”处理，避免边界漏标。
+        return not (end <= event.start or start > event.end)
 
     def _append_block(self, task: Task, start: datetime, end: datetime, reason: str, low_reliability: bool = False) -> None:
         self.blocks.append(Block(task.name, start, end, reason, low_reliability))
@@ -305,19 +325,56 @@ def print_schedule(blocks: List[Block], title: str) -> None:
         print(f"{b.start.strftime('%H:%M')} - {b.end.strftime('%H:%M')} | {b.task_name}{tag} | {b.reason}")
 
 
+def validate_schedule_constraints(blocks: List[Block], fixed_events: List[FixedEvent], english_target_minutes: int) -> None:
+    breakfast = next((e for e in fixed_events if e.name == "早餐"), None)
+    breakfast_ok = True
+    if breakfast:
+        for block in blocks:
+            if not (block.end <= breakfast.start or block.start >= breakfast.end):
+                breakfast_ok = False
+                break
+
+    english_window_start = datetime.strptime(ENGLISH_ONLY_START, "%H:%M").time()
+    english_window_end = datetime.strptime(ENGLISH_ONLY_END, "%H:%M").time()
+    english_minutes_in_window = 0
+    class_low_rel_ok = True
+
+    for block in blocks:
+        in_english_window = english_window_start <= block.start.time() < english_window_end
+        if in_english_window and "英语" in block.task_name:
+            english_minutes_in_window += block.duration_minutes
+
+        for event in fixed_events:
+            if not event.is_class:
+                continue
+            class_overlap = not (block.end <= event.start or block.start > event.end)
+            if class_overlap and (not block.low_reliability or "低可靠" not in block.reason):
+                class_low_rel_ok = False
+
+    english_ok = english_minutes_in_window >= min(english_target_minutes, 120)
+
+    print("\n=== 约束验证 ===")
+    print(f"早餐窗口无任务: {'PASS' if breakfast_ok else 'FAIL'}")
+    print(f"英语窗口优先填充: {'PASS' if english_ok else 'FAIL'} (窗口英语分钟={english_minutes_in_window})")
+    print(f"上课窗口低可靠一致标记: {'PASS' if class_low_rel_ok else 'FAIL'}")
+
+
 def demo() -> None:
     base_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     tasks = [
-        Task(name="英语听读", category="english", total_minutes=90, splittable=True, interruptible=True),
+        Task(name="英语听读", category="english", total_minutes=120, splittable=True, interruptible=True),
         Task(name="高数（深度）", category="math_deep", total_minutes=120, splittable=False, interruptible=False, min_block=120, max_block=120),
-        Task(name="高数（非深度）", category="math_non_deep", total_minutes=150, splittable=True, interruptible=True),
+        Task(name="高数（非深度）", category="math_non_deep", total_minutes=180, splittable=True, interruptible=True),
         Task(name="课程复盘", category="review", total_minutes=60, splittable=True, interruptible=True),
     ]
 
     fixed_events = [
-        FixedEvent("线性代数课", start=base_day.replace(hour=9, minute=0), end=base_day.replace(hour=10, minute=30), is_class=True),
-        FixedEvent("午餐", start=base_day.replace(hour=12, minute=0), end=base_day.replace(hour=12, minute=40), is_class=False),
+        FixedEvent("早餐", start=base_day.replace(hour=6, minute=0), end=base_day.replace(hour=6, minute=30), is_class=False),
+        FixedEvent("专业课", start=base_day.replace(hour=9, minute=0), end=base_day.replace(hour=10, minute=30), is_class=True),
+        FixedEvent("午饭", start=base_day.replace(hour=12, minute=0), end=base_day.replace(hour=12, minute=40), is_class=False),
+        FixedEvent("健身", start=base_day.replace(hour=17, minute=30), end=base_day.replace(hour=18, minute=30), is_class=False),
+        FixedEvent("晚饭", start=base_day.replace(hour=18, minute=40), end=base_day.replace(hour=19, minute=20), is_class=False),
     ]
 
     system = TimeManagementSystem(
@@ -330,8 +387,9 @@ def demo() -> None:
 
     original = system.schedule_day()
     print_schedule(original, "初始排程")
+    validate_schedule_constraints(original, fixed_events, english_target_minutes=120)
 
-    current_time = base_day.replace(hour=15, minute=10)
+    current_time = base_day.replace(hour=10, minute=5)
     updated = system.rolling_reschedule(current_time=current_time, disruption_minutes=45)
     print_schedule(updated, "滚动重排后")
 
