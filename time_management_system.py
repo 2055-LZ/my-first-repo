@@ -322,6 +322,40 @@ def print_schedule(blocks: List[Block], title: str) -> None:
         print(f"{b.start.strftime('%H:%M')} - {b.end.strftime('%H:%M')} | {b.task_name}{tag} | {b.reason}")
 
 
+def validate_schedule_constraints(blocks: List[Block], fixed_events: List[FixedEvent], english_target_minutes: int) -> None:
+    breakfast = next((e for e in fixed_events if e.name == "早餐"), None)
+    breakfast_ok = True
+    if breakfast:
+        for block in blocks:
+            if not (block.end <= breakfast.start or block.start >= breakfast.end):
+                breakfast_ok = False
+                break
+
+    english_window_start = datetime.strptime(ENGLISH_ONLY_START, "%H:%M").time()
+    english_window_end = datetime.strptime(ENGLISH_ONLY_END, "%H:%M").time()
+    english_minutes_in_window = 0
+    class_low_rel_ok = True
+
+    for block in blocks:
+        in_english_window = english_window_start <= block.start.time() < english_window_end
+        if in_english_window and "英语" in block.task_name:
+            english_minutes_in_window += block.duration_minutes
+
+        for event in fixed_events:
+            if not event.is_class:
+                continue
+            class_overlap = not (block.end <= event.start or block.start > event.end)
+            if class_overlap and (not block.low_reliability or "低可靠" not in block.reason):
+                class_low_rel_ok = False
+
+    english_ok = english_minutes_in_window >= min(english_target_minutes, 120)
+
+    print("\n=== 约束验证 ===")
+    print(f"早餐窗口无任务: {'PASS' if breakfast_ok else 'FAIL'}")
+    print(f"英语窗口优先填充: {'PASS' if english_ok else 'FAIL'} (窗口英语分钟={english_minutes_in_window})")
+    print(f"上课窗口低可靠一致标记: {'PASS' if class_low_rel_ok else 'FAIL'}")
+
+
 def demo() -> None:
     base_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -350,6 +384,7 @@ def demo() -> None:
 
     original = system.schedule_day()
     print_schedule(original, "初始排程")
+    validate_schedule_constraints(original, fixed_events, english_target_minutes=120)
 
     current_time = base_day.replace(hour=10, minute=5)
     updated = system.rolling_reschedule(current_time=current_time, disruption_minutes=45)
