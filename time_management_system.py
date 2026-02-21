@@ -83,6 +83,7 @@ class TimeManagementSystem:
         work_items = self._expand_tasks_by_shape_ratio(self.tasks)
         cursor = self._at(DAY_START)
 
+        # 固定安排：高数（深度）20:00-22:00。
         deep_math_items = [t for t in work_items if t.category == "math_deep"]
         other_items = [t for t in work_items if t.category != "math_deep"]
         if deep_math_items:
@@ -100,7 +101,8 @@ class TimeManagementSystem:
             slot = self._find_next_slot(cursor, task)
             if not slot:
                 break
-
+       codex/add-rolling-rearrangement-function-0u0tnx
+       main
             start, end, low_rel = slot
             reason = "常规调度"
             if low_rel:
@@ -132,6 +134,7 @@ class TimeManagementSystem:
         self.blocks = sorted(past_blocks, key=lambda b: b.start)
         cursor = disruption_end
 
+        # 保持最小扰动：保留原有顺序重新塞回。
         for task in remaining_items:
             while task.remaining_minutes > 0:
                 slot = self._find_next_slot(cursor, task)
