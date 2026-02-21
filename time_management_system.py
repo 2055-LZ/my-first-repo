@@ -12,14 +12,15 @@
    python time_management_system.py roll
    python time_management_system.py plan
 
-4) 使用 JSON 配置覆盖默认任务/固定事件
+4) 使用 JSON 配置覆盖默认任务/固定事件/目标
    python time_management_system.py plan --config config.json
 
 config.json 示例：
 {
   "allow_class_time": true,
+  "targets": {"EN_MIN": 240, "EN_MAX": 300, "MATH_MIN": 240, "MATH_MAX": 300},
   "tasks": [
-    {"name": "英语听读", "category": "english", "total_minutes": 120},
+    {"name": "英语听读", "category": "english", "total_minutes": 240},
     {"name": "高数（深度）", "category": "math_deep", "total_minutes": 120, "splittable": false, "interruptible": false, "min_block": 120, "max_block": 120},
     {"name": "高数（非深度）", "category": "math_non_deep", "total_minutes": 180},
     {"name": "课程复盘", "category": "review", "total_minutes": 60}
@@ -99,6 +100,14 @@ class EnergyProfile:
         return max(task.min_block, min(center, task.max_block))
 
 
+@dataclass
+class Targets:
+    EN_MIN: int = 240
+    EN_MAX: int = 300
+    MATH_MIN: int = 240
+    MATH_MAX: int = 300
+
+
 class TimeManagementSystem:
     def __init__(
         self,
@@ -107,12 +116,14 @@ class TimeManagementSystem:
         fixed_events: List[FixedEvent],
         energy_profile: Optional[EnergyProfile] = None,
         allow_class_time: bool = False,
+        targets: Optional[Targets] = None,
     ) -> None:
         self.date = date
         self.tasks = tasks
         self.fixed_events = sorted(fixed_events, key=lambda e: e.start)
         self.energy_profile = energy_profile or EnergyProfile()
         self.allow_class_time = allow_class_time
+        self.targets = targets or Targets()
         self.blocks: List[Block] = []
 
     def schedule_day(self) -> List[Block]:
@@ -120,12 +131,18 @@ class TimeManagementSystem:
         work_items = self._expand_tasks_by_shape_ratio(self.tasks)
         cursor = self._at(DAY_START)
 
+        self._check_feasibility()
+
         deep_math_items = [t for t in work_items if t.category == "math_deep"]
         other_items = [t for t in work_items if t.category != "math_deep"]
         if deep_math_items:
             deep_task = deep_math_items[0]
             deep_start, deep_end = self._at(DEEP_MATH_START), self._at(DEEP_MATH_END)
-            self._append_block(deep_task, deep_start, deep_end, "高数深度固定窗口")
+            deep_low_rel = self._thursday_deep_overlap_low_reliability(deep_start, deep_end)
+            reason = "高数深度固定窗口"
+            if deep_low_rel:
+                reason += "（低可靠：周四晚课重叠）"
+            self._append_block(deep_task, deep_start, deep_end, reason, deep_low_rel)
             deep_task.completed_minutes += min(120, deep_task.total_minutes)
             self._append_rest(deep_end, 20)
 
@@ -198,29 +215,74 @@ class TimeManagementSystem:
             error_minutes = total - practice_minutes
             expanded.extend(
                 [
-                    Task(name=f"{task.name}-刷题", category="math_practice", total_minutes=practice_minutes, splittable=True, interruptible=True, min_block=25, max_block=35, metadata={"ratio": "6"}),
-                    Task(name=f"{task.name}-错题整理", category="math_error_review", total_minutes=error_minutes, splittable=True, interruptible=True, min_block=25, max_block=35, metadata={"ratio": "4"}),
+                    Task(name=f"{task.name}-刷题", category="math_non_deep", total_minutes=practice_minutes, splittable=True, interruptible=True, min_block=25, max_block=35, metadata={"shape": "practice", "ratio": "6"}),
+                    Task(name=f"{task.name}-错题整理", category="math_non_deep", total_minutes=error_minutes, splittable=True, interruptible=True, min_block=25, max_block=35, metadata={"shape": "error_review", "ratio": "4"}),
                 ]
             )
         return expanded
 
-    def _next_available_task(self, tasks: List[Task], cursor: datetime) -> Optional[Task]:
-        english_task = self._english_task_with_remaining(tasks)
-        if english_task and cursor < self._at(ENGLISH_ONLY_END):
-            return english_task
-
+    def _learning_stats_from_tasks(self, tasks: List[Task]) -> Tuple[int, int]:
+        english_done = 0
+        math_done = 0
         for task in tasks:
+            done = task.completed_minutes
+            if task.category == "english":
+                english_done += done
+            if task.category in {"math_deep", "math_non_deep"}:
+                math_done += done
+        return english_done, math_done
+
+    def _learning_stats_from_blocks(self) -> Tuple[int, int]:
+        english_done = 0
+        math_done = 0
+        for block in self.blocks:
+            mins = block.duration_minutes
+            if "英语" in block.task_name:
+                english_done += mins
+            if "高数" in block.task_name:
+                math_done += mins
+        return english_done, math_done
+
+    def _next_available_task(self, tasks: List[Task], cursor: datetime) -> Optional[Task]:
+        if self._inside_english_only_window(cursor):
+            return self._pick_task_by_category(tasks, {"english"})
+
+        en_done, math_done = self._learning_stats_from_tasks(tasks)
+
+        if en_done < self.targets.EN_MIN:
+            t = self._pick_task_by_category(tasks, {"english"})
+            if t:
+                return t
+
+        if math_done < self.targets.MATH_MIN:
+            t = self._pick_task_by_category(tasks, {"math_non_deep", "math_deep"})
+            if t:
+                return t
+
+        en_gap = max(0, self.targets.EN_MAX - en_done)
+        math_gap = max(0, self.targets.MATH_MAX - math_done)
+        if en_gap > 0 or math_gap > 0:
+            if en_gap >= math_gap:
+                t = self._pick_task_by_category(tasks, {"english"})
+                if t:
+                    return t
+                return self._pick_task_by_category(tasks, {"math_non_deep", "math_deep"})
+            t = self._pick_task_by_category(tasks, {"math_non_deep", "math_deep"})
+            if t:
+                return t
+            return self._pick_task_by_category(tasks, {"english"})
+
+        return self._pick_task_by_category(tasks, {"review", "carry_over", "other", "rest", "english", "math_non_deep", "math_deep"})
+
+    def _pick_task_by_category(self, tasks: List[Task], categories: set[str]) -> Optional[Task]:
+        for task in tasks:
+            if task.category not in categories:
+                continue
             if task.metadata.get("blocked") == "1" or task.remaining_minutes <= 0:
                 continue
             if task.splittable and task.remaining_minutes < MIN_SPLIT_BLOCK:
                 continue
             return task
-        return None
-
-    def _english_task_with_remaining(self, tasks: List[Task]) -> Optional[Task]:
-        for task in tasks:
-            if task.category == "english" and task.remaining_minutes > 0:
-                return task
         return None
 
     def _find_next_slot(self, cursor: datetime, task: Task) -> Optional[Tuple[datetime, datetime, bool]]:
@@ -242,7 +304,7 @@ class TimeManagementSystem:
             if task.category == "math_deep":
                 deep_s, deep_e = self._at(DEEP_MATH_START), self._at(DEEP_MATH_END)
                 if t <= deep_s:
-                    return deep_s, deep_e, False
+                    return deep_s, deep_e, self._thursday_deep_overlap_low_reliability(deep_s, deep_e)
                 return None
 
             block_len = self._calculate_block_len(task)
@@ -290,15 +352,60 @@ class TimeManagementSystem:
             return not (end <= event.start or start >= event.end)
         return not (end <= event.start or start > event.end)
 
+    def _thursday_deep_overlap_low_reliability(self, start: datetime, end: datetime) -> bool:
+        if self.date.weekday() != 3:
+            return False
+        for event in self.fixed_events:
+            if not event.is_class:
+                continue
+            if not (end <= event.start or start >= event.end):
+                return True
+        return False
+
+    def _check_feasibility(self) -> None:
+        day_start = self._at(DAY_START)
+        day_end = self._at(DAY_END)
+        total = int((day_end - day_start).total_seconds() // 60)
+        unavailable = 0
+        for event in self.fixed_events:
+            s = max(day_start, event.start)
+            e = min(day_end, event.end)
+            if e > s:
+                unavailable += int((e - s).total_seconds() // 60)
+
+        available = max(0, total - unavailable)
+        need = self.targets.EN_MIN + self.targets.MATH_MIN + 20
+        if available < need:
+            print("提示：今日不可达，系统将优先保证深度锚点并尽量接近英语/高数目标")
+
     def _append_block(self, task: Task, start: datetime, end: datetime, reason: str, low_reliability: bool = False) -> None:
         self.blocks.append(Block(task.name, start, end, reason, low_reliability))
 
     def _carry_over_task_from_block(self, block: Block, minutes: int) -> Task:
+        category = "other"
         if block.task_name == "休息":
-            return Task(block.task_name, "rest", minutes, False, False, minutes, minutes, metadata={"source": "rolling", "earliest_start": block.start.isoformat()})
-        if "高数（深度）" in block.task_name:
-            return Task(block.task_name, "math_deep", minutes, False, False, 120, 120, metadata={"source": "rolling", "earliest_start": block.start.isoformat()})
-        return Task(block.task_name, "carry_over", minutes, True, True, 25, 35, metadata={"source": "rolling", "earliest_start": block.start.isoformat()})
+            category = "rest"
+        elif "英语" in block.task_name:
+            category = "english"
+        elif "高数（深度）" in block.task_name:
+            category = "math_deep"
+        elif "高数" in block.task_name:
+            category = "math_non_deep"
+
+        splittable = category not in {"math_deep", "rest"}
+        interruptible = category in {"english", "math_non_deep", "other"}
+        min_block = 25 if splittable else minutes
+        max_block = 35 if splittable else minutes
+        return Task(
+            block.task_name,
+            category,
+            minutes,
+            splittable,
+            interruptible,
+            min_block,
+            max_block,
+            metadata={"source": "rolling", "earliest_start": block.start.isoformat()},
+        )
 
     def _append_rest(self, start: datetime, minutes: int) -> None:
         self.blocks.append(Block("休息", start, start + timedelta(minutes=minutes), "高数深度后恢复", False))
@@ -421,10 +528,20 @@ def ask(prompt: str, default: Optional[str] = None) -> str:
     return val if val else (default or "")
 
 
-def load_config(path: Path, base_day: datetime) -> Tuple[Optional[bool], Optional[List[Task]], Optional[List[FixedEvent]]]:
+def load_config(path: Path, base_day: datetime) -> Tuple[Optional[bool], Optional[List[Task]], Optional[List[FixedEvent]], Optional[Targets]]:
     data = json.loads(path.read_text(encoding="utf-8"))
 
     allow_class_time = data.get("allow_class_time")
+
+    cfg_targets = None
+    if data.get("targets"):
+        t = data["targets"]
+        cfg_targets = Targets(
+            EN_MIN=int(t.get("EN_MIN", 240)),
+            EN_MAX=int(t.get("EN_MAX", 300)),
+            MATH_MIN=int(t.get("MATH_MIN", 240)),
+            MATH_MAX=int(t.get("MATH_MAX", 300)),
+        )
 
     tasks_data = data.get("tasks")
     tasks = None
@@ -457,24 +574,36 @@ def load_config(path: Path, base_day: datetime) -> Tuple[Optional[bool], Optiona
                 )
             )
 
-    return allow_class_time, tasks, fixed_events
+    return allow_class_time, tasks, fixed_events, cfg_targets
 
 
-def run(mode: str, base_day: datetime, allow_class_time: bool, tasks: List[Task], fixed_events: List[FixedEvent], current_time: Optional[str], disruption_minutes: Optional[int]) -> None:
+def run(
+    mode: str,
+    base_day: datetime,
+    allow_class_time: bool,
+    tasks: List[Task],
+    fixed_events: List[FixedEvent],
+    current_time: Optional[str],
+    disruption_minutes: Optional[int],
+    targets: Targets,
+) -> None:
     system = TimeManagementSystem(
         date=base_day,
         tasks=tasks,
         fixed_events=fixed_events,
         energy_profile=EnergyProfile(),
         allow_class_time=allow_class_time,
+        targets=targets,
     )
 
     initial = system.schedule_day()
     print_schedule(initial, "初始排程")
     print_timeline(system._at(DAY_START), system._at(DAY_END), fixed_events, initial)
 
-    english_target = next((t.total_minutes for t in tasks if t.category == "english"), 0)
+    english_target = next((t.total_minutes for t in tasks if t.category == "english"), targets.EN_MIN)
     validate_schedule_constraints(initial, fixed_events, english_target_minutes=english_target)
+    en_done, math_done = system._learning_stats_from_blocks()
+    print(f"学习统计: 英语={en_done}min, 数学={math_done}min")
 
     if mode == "roll":
         if not current_time:
@@ -486,6 +615,8 @@ def run(mode: str, base_day: datetime, allow_class_time: bool, tasks: List[Task]
         print_schedule(rolled, "滚动重排后")
         print_timeline(system._at(DAY_START), system._at(DAY_END), fixed_events, rolled)
         validate_schedule_constraints(rolled, fixed_events, english_target_minutes=english_target)
+        en_done, math_done = system._learning_stats_from_blocks()
+        print(f"学习统计(重排后): 英语={en_done}min, 数学={math_done}min")
 
 
 def main() -> None:
@@ -510,8 +641,9 @@ def main() -> None:
     cfg_allow = None
     cfg_tasks = None
     cfg_fixed_events = None
+    cfg_targets = None
     if args.config:
-        cfg_allow, cfg_tasks, cfg_fixed_events = load_config(Path(args.config), base_day)
+        cfg_allow, cfg_tasks, cfg_fixed_events, cfg_targets = load_config(Path(args.config), base_day)
 
     allow_raw = args.allow_class_time
     if allow_raw is None and cfg_allow is None:
@@ -521,13 +653,14 @@ def main() -> None:
     if cfg_tasks is not None:
         tasks = cfg_tasks
     else:
-        english = args.english if args.english is not None else int(ask("english_minutes", "120"))
+        english = args.english if args.english is not None else int(ask("english_minutes", "240"))
         math_deep = args.math_deep if args.math_deep is not None else int(ask("math_deep_minutes", "120"))
         math_non_deep = args.math_non_deep if args.math_non_deep is not None else int(ask("math_non_deep_minutes", "180"))
         review = args.review if args.review is not None else int(ask("review_minutes", "60"))
         tasks = build_tasks(english, math_deep, math_non_deep, review)
 
     fixed_events = cfg_fixed_events if cfg_fixed_events is not None else build_default_fixed_events(base_day)
+    targets = cfg_targets if cfg_targets is not None else Targets()
 
     run(
         mode=mode,
@@ -537,6 +670,7 @@ def main() -> None:
         fixed_events=fixed_events,
         current_time=args.current_time,
         disruption_minutes=args.disruption,
+        targets=targets,
     )
 
 
