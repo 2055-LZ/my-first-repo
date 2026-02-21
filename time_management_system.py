@@ -84,6 +84,7 @@ class TimeManagementSystem:
         work_items = self._expand_tasks_by_shape_ratio(self.tasks)
         cursor = self._at(DAY_START)
 
+        # 固定安排：高数（深度）20:00-22:00。
         deep_math_items = [t for t in work_items if t.category == "math_deep"]
         other_items = [t for t in work_items if t.category != "math_deep"]
         if deep_math_items:
