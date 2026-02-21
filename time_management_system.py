@@ -5,12 +5,13 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 
-DAY_START = "06:00"
+DAY_START = "05:30"
 DAY_END = "23:30"
 ENGLISH_ONLY_START = "06:30"
 ENGLISH_ONLY_END = "08:30"
 DEEP_MATH_START = "20:00"
 DEEP_MATH_END = "22:00"
+MIN_SPLIT_BLOCK = 25
 
 
 @dataclass
@@ -53,7 +54,7 @@ class Block:
 
 @dataclass
 class EnergyProfile:
-    focus_windows: List[Tuple[str, str]] = field(default_factory=lambda: [("09:00", "11:30"), ("14:00", "17:00"), ("20:00", "22:00")])
+    focus_windows: List[Tuple[str, str]] = field(default_factory=lambda: [("06:30", "08:30"), ("12:40", "13:50"), ("20:00", "22:00")])
 
     def suggest_block_size(self, task: Task) -> int:
         if not task.splittable:
@@ -100,9 +101,9 @@ class TimeManagementSystem:
 
             slot = self._find_next_slot(cursor, task)
             if not slot:
-                break
-       codex/add-rolling-rearrangement-function-0u0tnx
-       main
+                task.metadata["blocked"] = "1"
+                continue
+
             start, end, low_rel = slot
             reason = "常规调度"
             if low_rel:
@@ -134,7 +135,6 @@ class TimeManagementSystem:
         self.blocks = sorted(past_blocks, key=lambda b: b.start)
         cursor = disruption_end
 
-        # 保持最小扰动：保留原有顺序重新塞回。
         for task in remaining_items:
             while task.remaining_minutes > 0:
                 slot = self._find_next_slot(cursor, task)
@@ -193,8 +193,13 @@ class TimeManagementSystem:
             return english_task
 
         for task in tasks:
-            if task.remaining_minutes > 0:
-                return task
+            if task.metadata.get("blocked") == "1":
+                continue
+            if task.remaining_minutes <= 0:
+                continue
+            if task.splittable and task.remaining_minutes < MIN_SPLIT_BLOCK:
+                continue
+            return task
         return None
 
     def _english_task_with_remaining(self, tasks: List[Task]) -> Optional[Task]:
@@ -226,11 +231,9 @@ class TimeManagementSystem:
                     return deep_s, deep_e, False
                 return None
 
-            block_len = self.energy_profile.suggest_block_size(task)
-            if not task.splittable:
-                block_len = task.remaining_minutes
-            else:
-                block_len = min(block_len, task.remaining_minutes)
+            block_len = self._calculate_block_len(task)
+            if block_len is None:
+                return None
             candidate_end = t + timedelta(minutes=block_len)
 
             if candidate_end > end_of_day:
@@ -242,6 +245,17 @@ class TimeManagementSystem:
             t += step
 
         return None
+
+    def _calculate_block_len(self, task: Task) -> Optional[int]:
+        if not task.splittable:
+            return task.remaining_minutes
+        if task.remaining_minutes < MIN_SPLIT_BLOCK:
+            return None
+        preferred = self.energy_profile.suggest_block_size(task)
+        block_len = min(preferred, task.remaining_minutes)
+        if block_len < MIN_SPLIT_BLOCK:
+            return None
+        return block_len
 
     def _has_conflict_or_low_reliability(self, start: datetime, end: datetime, task: Task) -> Tuple[bool, bool]:
         low_reliability = False
@@ -266,7 +280,6 @@ class TimeManagementSystem:
     def _event_overlap(self, start: datetime, end: datetime, event: FixedEvent) -> bool:
         if not event.is_class:
             return not (end <= event.start or start >= event.end)
-        # 上课窗口按“结束点也算低可靠边界”处理，避免边界漏标。
         return not (end <= event.start or start > event.end)
 
     def _append_block(self, task: Task, start: datetime, end: datetime, reason: str, low_reliability: bool = False) -> None:
@@ -319,10 +332,50 @@ class TimeManagementSystem:
 
 
 def print_schedule(blocks: List[Block], title: str) -> None:
-    print(f"\n=== {title} ===")
+    print(f"\n=== {title}（简表）===")
     for b in sorted(blocks, key=lambda x: x.start):
         tag = " [低可靠]" if b.low_reliability else ""
         print(f"{b.start.strftime('%H:%M')} - {b.end.strftime('%H:%M')} | {b.task_name}{tag} | {b.reason}")
+
+
+def print_timeline(day_start: datetime, day_end: datetime, fixed_events: List[FixedEvent], blocks: List[Block]) -> None:
+    points = {day_start, day_end}
+    for event in fixed_events:
+        if event.end <= day_start or event.start >= day_end:
+            continue
+        points.add(max(day_start, event.start))
+        points.add(min(day_end, event.end))
+    for block in blocks:
+        if block.end <= day_start or block.start >= day_end:
+            continue
+        points.add(max(day_start, block.start))
+        points.add(min(day_end, block.end))
+
+    timeline = sorted(points)
+    print("\n=== 完整时间线 ===")
+    for i in range(len(timeline) - 1):
+        seg_start, seg_end = timeline[i], timeline[i + 1]
+        if seg_start >= seg_end:
+            continue
+
+        covering_events = [e for e in fixed_events if not (seg_end <= e.start or seg_start >= e.end)]
+        covering_blocks = [b for b in blocks if not (seg_end <= b.start or seg_start >= b.end)]
+
+        if covering_blocks and covering_events:
+            task = covering_blocks[0]
+            event_names = ",".join(e.name for e in covering_events)
+            tag = " [低可靠]" if task.low_reliability else ""
+            label = f"任务:{task.task_name}{tag} | 固定事件:{event_names}"
+        elif covering_blocks:
+            task = covering_blocks[0]
+            tag = " [低可靠]" if task.low_reliability else ""
+            label = f"任务:{task.task_name}{tag}"
+        elif covering_events:
+            label = "固定事件:" + ",".join(e.name for e in covering_events)
+        else:
+            label = "空闲/机动"
+
+        print(f"{seg_start.strftime('%H:%M')} - {seg_end.strftime('%H:%M')} | {label}")
 
 
 def validate_schedule_constraints(blocks: List[Block], fixed_events: List[FixedEvent], english_target_minutes: int) -> None:
@@ -338,8 +391,12 @@ def validate_schedule_constraints(blocks: List[Block], fixed_events: List[FixedE
     english_window_end = datetime.strptime(ENGLISH_ONLY_END, "%H:%M").time()
     english_minutes_in_window = 0
     class_low_rel_ok = True
+    no_fragment_ok = True
 
     for block in blocks:
+        if block.task_name not in {"休息", "机动/缓冲"} and block.duration_minutes < MIN_SPLIT_BLOCK and "高数（深度）" not in block.task_name:
+            no_fragment_ok = False
+
         in_english_window = english_window_start <= block.start.time() < english_window_end
         if in_english_window and "英语" in block.task_name:
             english_minutes_in_window += block.duration_minutes
@@ -357,6 +414,7 @@ def validate_schedule_constraints(blocks: List[Block], fixed_events: List[FixedE
     print(f"早餐窗口无任务: {'PASS' if breakfast_ok else 'FAIL'}")
     print(f"英语窗口优先填充: {'PASS' if english_ok else 'FAIL'} (窗口英语分钟={english_minutes_in_window})")
     print(f"上课窗口低可靠一致标记: {'PASS' if class_low_rel_ok else 'FAIL'}")
+    print(f"无碎片学习块(<25min): {'PASS' if no_fragment_ok else 'FAIL'}")
 
 
 def demo() -> None:
@@ -371,10 +429,11 @@ def demo() -> None:
 
     fixed_events = [
         FixedEvent("早餐", start=base_day.replace(hour=6, minute=0), end=base_day.replace(hour=6, minute=30), is_class=False),
-        FixedEvent("专业课", start=base_day.replace(hour=9, minute=0), end=base_day.replace(hour=10, minute=30), is_class=True),
-        FixedEvent("午饭", start=base_day.replace(hour=12, minute=0), end=base_day.replace(hour=12, minute=40), is_class=False),
-        FixedEvent("健身", start=base_day.replace(hour=17, minute=30), end=base_day.replace(hour=18, minute=30), is_class=False),
-        FixedEvent("晚饭", start=base_day.replace(hour=18, minute=40), end=base_day.replace(hour=19, minute=20), is_class=False),
+        FixedEvent("上午上课", start=base_day.replace(hour=8, minute=30), end=base_day.replace(hour=12, minute=10), is_class=True),
+        FixedEvent("午饭", start=base_day.replace(hour=12, minute=10), end=base_day.replace(hour=12, minute=40), is_class=False),
+        FixedEvent("下午上课", start=base_day.replace(hour=14, minute=0), end=base_day.replace(hour=17, minute=40), is_class=True),
+        FixedEvent("健身", start=base_day.replace(hour=18, minute=0), end=base_day.replace(hour=19, minute=0), is_class=False),
+        FixedEvent("晚饭", start=base_day.replace(hour=19, minute=0), end=base_day.replace(hour=19, minute=40), is_class=False),
     ]
 
     system = TimeManagementSystem(
@@ -387,11 +446,13 @@ def demo() -> None:
 
     original = system.schedule_day()
     print_schedule(original, "初始排程")
+    print_timeline(system._at(DAY_START), system._at(DAY_END), fixed_events, original)
     validate_schedule_constraints(original, fixed_events, english_target_minutes=120)
 
     current_time = base_day.replace(hour=10, minute=5)
     updated = system.rolling_reschedule(current_time=current_time, disruption_minutes=45)
     print_schedule(updated, "滚动重排后")
+    print_timeline(system._at(DAY_START), system._at(DAY_END), fixed_events, updated)
 
 
 if __name__ == "__main__":
